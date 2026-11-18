@@ -223,6 +223,11 @@ documentation.
    timeout from the scheduled callbacks, and calls the underlying
    selector.  Returns the raw event list.
 
+   On :class:`ProactorEventLoop`, it waits for completion statuses
+   instead, and returns those; that loop's own iterations poll through
+   its proactor directly, rather than through this method and
+   :meth:`process_events`.
+
    .. versionadded:: 3.16
 
 .. method:: loop.process_events(event_list)

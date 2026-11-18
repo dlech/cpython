@@ -30,6 +30,7 @@ import sys
 import threading
 from functools import partial
 
+from . import base_events
 from . import constants
 from . import events
 from . import runners
@@ -190,6 +191,10 @@ def start_guest_run(async_fn, *args,
 
     shutdown = threading.Event()
     wakeup = threading.Semaphore(0)
+    # Until when the I/O thread may wait (loop.time(), or None for no
+    # limit), computed by the host before it hands over the token: only
+    # the host touches the loop's timers.
+    poll_deadline = None
     finished = False
     cleaned_up = False
 
@@ -287,6 +292,22 @@ def start_guest_run(async_fn, *args,
             return
         finished = True
         _join_backend()
+        event_list = base_events._events_from(exc)
+        if event_list:
+            # The failed poll took these events before failing: process
+            # them, or their futures would never complete, and closing the
+            # loop would wait for them.
+            host_state = _enter_guest()
+            try:
+                loop.process_events(event_list)
+            except Exception as e:
+                loop.call_exception_handler({
+                    'message': ('asyncio guest run could not process the '
+                                'events of its failed poll'),
+                    'exception': e,
+                })
+            finally:
+                _leave_guest(host_state)
         _cleanup_running_state()
         if not main_task.done():
             main_task.cancel(
@@ -308,6 +329,7 @@ def start_guest_run(async_fn, *args,
 
     def _process_on_host(event_list):
         """Process one batch of asyncio work on the host thread."""
+        nonlocal poll_deadline
         if shutdown.is_set() or loop.is_closed():
             return
         host_state = _enter_guest()
@@ -316,6 +338,7 @@ def start_guest_run(async_fn, *args,
             event_list = None
             loop.process_ready()
             timeout = loop._poll_timeout()
+            deadline = None if timeout is None else loop.time() + timeout
         except BaseException:
             # Internal loop failure (user callback exceptions are routed
             # to the exception handler by Handle._run).  Unblock the I/O
@@ -331,7 +354,7 @@ def start_guest_run(async_fn, *args,
         # is work to do right away, run the next batch on the host too;
         # a round trip through the I/O thread costs two thread switches.
         try:
-            event_list = loop._selector.select(0)
+            event_list = loop._poll_events(0)
         except Exception as exc:
             # Report it like an I/O thread failure.  Scheduled rather
             # than called inline, so that _abort() can join the I/O
@@ -346,6 +369,7 @@ def start_guest_run(async_fn, *args,
         # token circulates: while the host runs a batch, the I/O thread
         # is parked in wakeup.acquire(), so it can never poll (or touch
         # the loop at all) concurrently with this function.
+        poll_deadline = deadline
         wakeup.release()
 
     def _on_task_done(task):
@@ -372,7 +396,13 @@ def start_guest_run(async_fn, *args,
                 wakeup.acquire()
                 if shutdown.is_set():
                     return
-                event_list = loop.poll_events()
+                # Only wait: the host computed the deadline, so the loop's
+                # timers are only ever touched on the host thread.
+                if poll_deadline is None:
+                    timeout = None
+                else:
+                    timeout = max(0, poll_deadline - loop.time())
+                event_list = loop._poll_events(timeout)
                 if shutdown.is_set():
                     # Interpreter exit woke the selector; the host may
                     # be gone, so do not call into it.

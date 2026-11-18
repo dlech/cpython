@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from unittest import mock
+from test import support
 from test.support import threading_helper
 from test.support.script_helper import assert_python_ok
 
@@ -254,6 +255,130 @@ class TestGuestRun(GuestTestCase):
 
         task = self._run_guest(coro)
         self.assertEqual(task.result(), "ok")
+
+    def _threads_calling(self, cls, name):
+        # Patches cls.name to record the threads that call it.
+        original = getattr(cls, name)
+        threads = set()
+
+        def recording(self, *args, **kwargs):
+            threads.add(threading.get_ident())
+            return original(self, *args, **kwargs)
+
+        return mock.patch.object(cls, name, recording), threads
+
+    @unittest.skipUnless(sys.platform == 'win32', 'IOCP only')
+    def test_io_processed_on_host_thread(self):
+        # Data arrives while the I/O thread waits for it.  The I/O thread
+        # only waits: what arrived is processed on the host thread.
+        from asyncio import windows_events
+        patch, threads = self._threads_calling(
+            windows_events.IocpProactor, '_process_completion_status')
+
+        async def coro():
+            loop = asyncio.get_running_loop()
+            a, b = socket.socketpair()
+            a.setblocking(False)
+            try:
+                for i in range(3):
+                    timer = threading.Timer(0.05, b.send, [b'%d' % i])
+                    timer.start()
+                    self.assertEqual(await loop.sock_recv(a, 10), b'%d' % i)
+                    timer.join()
+            finally:
+                a.close()
+                b.close()
+            return "ok"
+
+        with patch:
+            task = self._run_guest(coro)
+        self.assertEqual(task.result(), "ok")
+        self.assertEqual(threads, {threading.get_ident()})
+
+    @unittest.skipUnless(sys.platform == 'win32', 'IOCP only')
+    def test_abort_processes_events_of_failed_poll(self):
+        # If the I/O thread's wait fails after taking completions off the
+        # port, _abort() processes them: their futures complete, and closing
+        # the loop doesn't wait for them forever.
+        from asyncio import base_events, windows_events
+        wait = windows_events.IocpProactor._wait_for_completion_statuses
+
+        def failing_wait(self, timeout=None):
+            # Fails once the recv's completion is among the statuses.
+            statuses = wait(self, timeout)
+            if (any(status[3] == recv_address for status in statuses) and
+                    threading.current_thread().name == 'asyncio-guest-io'):
+                error = OSError(22, 'injected')
+                base_events._attach_events(error, statuses)
+                raise error
+            return statuses
+
+        errors = []
+        recv = recv_address = None
+
+        async def coro():
+            nonlocal recv, recv_address
+            loop = asyncio.get_running_loop()
+            loop.set_exception_handler(
+                lambda loop, context: errors.append(context))
+            a, b = socket.socketpair()
+            try:
+                recv = loop._proactor.recv(a, 10)
+                recv_address = recv._ov.address
+                timer = threading.Timer(0.05, b.send, [b'data'])
+                timer.start()
+                try:
+                    await recv
+                finally:
+                    timer.join()
+            finally:
+                a.close()
+                b.close()
+
+        close = windows_events.IocpProactor.close
+
+        def checked_close(self):
+            # Without the fix the recv's completion is dropped, so close()
+            # would wait for it forever.  The kernel is done with it (its
+            # status was taken off the port), so forget it: the assertions
+            # below then fail rather than hang.
+            if recv is not None and recv.cancelled():
+                self._cache.pop(recv_address, None)
+            close(self)
+
+        with (mock.patch.object(windows_events.IocpProactor,
+                                '_wait_for_completion_statuses',
+                                failing_wait),
+              mock.patch.object(windows_events.IocpProactor, 'close',
+                                checked_close)):
+            task = self._run_guest(coro)
+        self.assertTrue(task.cancelled())
+        self.assertEqual(recv.result(), b'data')
+        self.assertEqual(
+            [context['message'] for context in errors],
+            ['asyncio guest I/O thread failed'])
+        # The error's traceback holds frames of the I/O thread and the
+        # task: let go of them, so the threads don't outlive the test.
+        errors.clear()
+        task = recv = None
+        support.gc_collect()
+
+    def test_timers_read_on_host_thread(self):
+        # The I/O thread only waits: the host computes how long, so only
+        # the host thread touches the loop's timers.
+        from asyncio import base_events
+        patch, threads = self._threads_calling(
+            base_events.BaseEventLoop, '_poll_timeout')
+
+        async def coro():
+            for _ in range(3):
+                await asyncio.sleep(0.02)
+            return "ok"
+
+        with patch:
+            task = self._run_guest(coro)
+        self.assertEqual(task.result(), "ok")
+        self.assertEqual(threads, {threading.get_ident()})
 
     # -- polling -------------------------------------------------------
 
@@ -640,6 +765,23 @@ class TestBaseEventLoopDecomposition(GuestTestCase):
 
         result = asyncio.run(coro())
         self.assertEqual(result, "ok")
+
+    def test_run_once_uses_overrides(self):
+        # A selector loop's _run_once() goes through poll_events() and
+        # process_events(), so overriding them affects a running loop too.
+        calls = []
+
+        class Loop(asyncio.SelectorEventLoop):
+            def process_events(self, event_list):
+                calls.append(event_list)
+                super().process_events(event_list)
+
+        loop = Loop()
+        try:
+            loop.run_until_complete(asyncio.sleep(0))
+        finally:
+            loop.close()
+        self.assertTrue(calls)
 
 
 if __name__ == '__main__':

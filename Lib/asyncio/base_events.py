@@ -71,6 +71,18 @@ _HAS_IPv6 = hasattr(socket, 'AF_INET6')
 MAXIMUM_SELECT_TIMEOUT = 24 * 3600
 
 
+# If a loop's _poll_events() fails after taking events, such as completion
+# statuses off an IOCP port, the exception carries them, so the caller can
+# still process them; else their futures would never complete.
+
+def _attach_events(exc, events):
+    exc._asyncio_events = events
+
+
+def _events_from(exc):
+    return getattr(exc, '_asyncio_events', ())
+
+
 def _format_handle(handle):
     cb = handle._callback
     if isinstance(getattr(cb, '__self__', None), tasks.Task):
@@ -2019,8 +2031,13 @@ class BaseEventLoop(events.AbstractEventLoop):
         """Poll for I/O events without processing them.
 
         Cleans up cancelled scheduled handles, computes an appropriate
-        timeout from the scheduled callbacks, and calls
-        ``self._selector.select(timeout)``.  Returns the raw event list.
+        timeout from the scheduled callbacks, and waits for I/O events
+        with ``self._selector.select(timeout)``.  Returns the raw event
+        list.  (ProactorEventLoop waits for completion statuses instead,
+        and returns those; its own iterations poll through the proactor's
+        ``select()``, which waits and processes in one.)  Call it on the
+        loop's thread: computing the timeout reads and updates the loop's
+        timers.
 
         This method, together with :meth:`process_events` and
         :meth:`process_ready`, decomposes :meth:`_run_once` into
@@ -2029,7 +2046,13 @@ class BaseEventLoop(events.AbstractEventLoop):
 
         .. versionadded:: 3.16
         """
-        return self._selector.select(self._poll_timeout())
+        return self._poll_events(self._poll_timeout())
+
+    def _poll_events(self, timeout):
+        # May run on a thread other than the loop's (see
+        # asyncio.start_guest_run): it must only wait, and leave
+        # everything that touches the loop to process_events().
+        return self._selector.select(timeout)
 
     def _poll_timeout(self):
         """Return the timeout for the next selector poll.
@@ -2139,11 +2162,13 @@ class BaseEventLoop(events.AbstractEventLoop):
         schedules the resulting callbacks, and finally schedules
         'call_later' callbacks.
         """
+        self._poll_and_process_events()
+        self.process_ready()
+
+    def _poll_and_process_events(self):
         event_list = self.poll_events()
         self.process_events(event_list)
         event_list = None       # Needed to break cycles on exception.
-        self.process_ready()
-        handle = None  # Needed to break cycles when an exception occurs.
 
     def _set_coroutine_origin_tracking(self, enabled):
         if bool(enabled) == bool(self._coroutine_origin_tracking_enabled):

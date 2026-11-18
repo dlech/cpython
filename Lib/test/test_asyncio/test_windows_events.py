@@ -16,6 +16,7 @@ import _overlapped
 import _winapi
 
 import asyncio
+from asyncio import base_events
 from asyncio import windows_events
 from asyncio import windows_utils
 from test import support
@@ -382,6 +383,78 @@ class ProactorTests(WindowsEventsTestCase):
 
         self.assertTrue(fut.done())
         self.assertEqual(fut.result(), b'data')
+
+    def test_poll_events_only_waits(self):
+        # gh-145342: poll_events() doesn't process completions:
+        # process_events() does, on the loop's thread.  (Its wait,
+        # _poll_events(), may run on another thread, as in guest mode.)
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+
+        fut = self.loop._proactor.recv(a, 100)
+        b.send(b'data')
+        # A timer bounds the wait, should the completion never come.
+        timer = self.loop.call_later(support.SHORT_TIMEOUT, lambda: None)
+        self.addCleanup(timer.cancel)
+        statuses = self.loop.poll_events()
+        self.assertTrue(statuses)
+        self.assertFalse(fut.done())
+
+        self.loop.process_events(statuses)
+        self.assertEqual(fut.result(), b'data')
+
+    def test_wait_for_completion_statuses_keeps_statuses_on_error(self):
+        # gh-145342: statuses already taken off the port aren't lost when
+        # a later GetQueuedCompletionStatus() fails: the error carries
+        # them, and _poll() processes them before raising it.
+        proactor = self.loop._proactor
+        status = (0, 4, 0, 0x1234)
+
+        error = OSError(22, 'invalid')
+        with mock.patch.object(
+                windows_events._overlapped, 'GetQueuedCompletionStatus',
+                side_effect=[status, error]):
+            with self.assertRaises(OSError) as cm:
+                proactor._wait_for_completion_statuses(0)
+        self.assertIs(cm.exception, error)
+        self.assertEqual(base_events._events_from(error), [status])
+
+        error = OSError(22, 'invalid')
+        with (mock.patch.object(
+                  windows_events._overlapped, 'GetQueuedCompletionStatus',
+                  side_effect=[status, error]),
+              mock.patch.object(proactor, '_process_completion_status')
+              as process):
+            with self.assertRaises(OSError) as cm:
+                proactor._poll(0)
+        self.assertIs(cm.exception, error)
+        process.assert_called_once_with(status)
+
+        error = OSError(22, 'invalid')
+        with mock.patch.object(
+                windows_events._overlapped, 'GetQueuedCompletionStatus',
+                side_effect=error):
+            with self.assertRaises(OSError):
+                proactor._wait_for_completion_statuses(0)
+        self.assertFalse(base_events._events_from(error))
+
+    def test_run_once_polls_with_select(self):
+        # gh-145342: outside asyncio guest mode, the loop polls through
+        # IocpProactor.select(), which GUI integrations override.
+        timeouts = []
+
+        class Proactor(windows_events.IocpProactor):
+            def select(self, timeout=None):
+                timeouts.append(timeout)
+                return super().select(timeout)
+
+        loop = asyncio.ProactorEventLoop(Proactor())
+        try:
+            loop.run_until_complete(asyncio.sleep(0))
+        finally:
+            loop.close()
+        self.assertTrue(timeouts)
 
 
 class ProactorPipeObjectSupportTests(unittest.TestCase):

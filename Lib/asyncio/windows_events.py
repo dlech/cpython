@@ -15,6 +15,7 @@ import struct
 import time
 import weakref
 
+from . import base_events
 from . import base_subprocess
 from . import futures
 from . import exceptions
@@ -315,6 +316,24 @@ class ProactorEventLoop(proactor_events.BaseProactorEventLoop):
                 self._proactor._unregister(ov)
             self._self_reading_future = None
 
+    def _poll_and_process_events(self):
+        # Polls through the proactor's select(), which waits and processes
+        # in one, as proactor subclasses that override it expect (GUI
+        # integrations do), rather than poll_events(), which only waits.
+        event_list = self._proactor.select(self._poll_timeout())
+        self._process_events(event_list)
+        event_list = None       # Needed to break cycles on exception.
+
+    def _poll_events(self, timeout):
+        # Only waits, so it may run on another thread (as in guest mode):
+        # processing a completion runs its callback and completes its
+        # future, which process_events() does, on the loop's thread.
+        return self._proactor._wait_for_completion_statuses(timeout)
+
+    def process_events(self, event_list):
+        self._process_events(
+            self._proactor._process_completion_statuses(event_list))
+
     async def create_pipe_connection(self, protocol_factory, address):
         f = self._proactor.connect_pipe(address)
         pipe = await f
@@ -394,6 +413,19 @@ class ProactorEventLoop(proactor_events.BaseProactorEventLoop):
         return transp
 
 
+def _timeout_to_ms(timeout):
+    if timeout is None:
+        return INFINITE
+    elif timeout < 0:
+        raise ValueError("negative timeout")
+    # GetQueuedCompletionStatus() has a resolution of 1 millisecond,
+    # round away from zero to wait *at least* timeout seconds.
+    ms = math.ceil(timeout * 1e3)
+    if ms >= INFINITE:
+        raise ValueError("timeout too big")
+    return ms
+
+
 class IocpProactor:
     """Proactor implementation using IOCP."""
 
@@ -424,6 +456,9 @@ class IocpProactor:
     def select(self, timeout=None):
         if not self._results:
             self._poll(timeout)
+        return self._take_results()
+
+    def _take_results(self):
         tmp = self._results
         self._results = []
         try:
@@ -786,31 +821,57 @@ class IocpProactor:
             finally:
                 f = None
 
-    def _poll(self, timeout=None):
-        if timeout is None:
-            ms = INFINITE
-        elif timeout < 0:
-            raise ValueError("negative timeout")
-        else:
-            # GetQueuedCompletionStatus() has a resolution of 1 millisecond,
-            # round away from zero to wait *at least* timeout seconds.
-            ms = math.ceil(timeout * 1e3)
-            if ms >= INFINITE:
-                raise ValueError("timeout too big")
-
-        while True:
-            status = _overlapped.GetQueuedCompletionStatus(self._iocp, ms)
-            if status is None:
-                break
-            ms = 0
-
-            # gh-154971: split out so custom event loops can call it directly
-            self._process_completion_status(status)
-
-        # Remove unregistered futures
+    def _remove_unregistered(self):
         for ov in self._unregistered:
             self._cache.pop(ov.address, None)
         self._unregistered.clear()
+
+    def _poll(self, timeout=None):
+        try:
+            statuses = self._wait_for_completion_statuses(timeout)
+        except OSError as e:
+            # Process what was taken off the port before the error.
+            self._process_statuses(base_events._events_from(e))
+            raise
+        self._process_statuses(statuses)
+
+    def _process_statuses(self, statuses):
+        for status in statuses:
+            # gh-154971: split out so custom event loops can call it directly
+            self._process_completion_status(status)
+        self._remove_unregistered()
+
+    def _wait_for_completion_statuses(self, timeout=None):
+        """Wait for statuses from the completion port, and return them.
+
+        Unlike _poll(), this doesn't process them, so it may run on a
+        thread other than the event loop's, as in asyncio guest mode.
+        Pass what it returns to _process_completion_statuses(), on the
+        event loop's thread.
+        """
+        ms = _timeout_to_ms(timeout)
+        statuses = []
+        while True:
+            try:
+                status = _overlapped.GetQueuedCompletionStatus(self._iocp, ms)
+            except OSError as e:
+                if statuses:
+                    # The statuses already taken off the port go with the
+                    # error, for the caller to process: else they're lost.
+                    base_events._attach_events(e, statuses)
+                raise
+            if status is None:
+                return statuses
+            ms = 0
+            statuses.append(status)
+
+    def _process_completion_statuses(self, statuses):
+        """Process statuses from _wait_for_completion_statuses().
+
+        Return the futures they completed, as select() does.
+        """
+        self._process_statuses(statuses)
+        return self._take_results()
 
     def _stop_serving(self, obj):
         # obj is a socket or pipe handle.  It will be closed in
