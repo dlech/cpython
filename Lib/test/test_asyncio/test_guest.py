@@ -385,22 +385,28 @@ class TestGuestRun(GuestTestCase):
     def test_ready_callbacks_do_not_go_through_io_thread(self):
         # While callbacks are ready the poll timeout is zero; such polls
         # run on the host thread instead of being handed to the I/O thread.
-        orig_poll_events = asyncio.BaseEventLoop.poll_events
-        io_polls = 0
+        if sys.platform == 'win32':
+            loop_class = asyncio.windows_events.ProactorEventLoop
+        else:
+            loop_class = asyncio.BaseEventLoop
+        orig_poll_events = loop_class._poll_events
+        polls = io_polls = 0
 
-        def poll_events(loop):
-            nonlocal io_polls
-            io_polls += 1
-            return orig_poll_events(loop)
+        def poll_events(loop, timeout):
+            nonlocal polls, io_polls
+            polls += 1
+            if threading.current_thread().name == 'asyncio-guest-io':
+                io_polls += 1
+            return orig_poll_events(loop, timeout)
 
         async def coro():
             for _ in range(1000):
                 await asyncio.sleep(0)
 
-        with mock.patch.object(asyncio.BaseEventLoop, 'poll_events',
-                               poll_events):
+        with mock.patch.object(loop_class, '_poll_events', poll_events):
             task = self._run_guest(coro)
         self.assertIsNone(task.result())
+        self.assertGreater(polls, 0)  # the patch is on the polls used
         self.assertLess(io_polls, 10)
 
     def test_busy_guest_does_not_starve_host(self):
