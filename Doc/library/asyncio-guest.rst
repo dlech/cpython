@@ -73,10 +73,22 @@ example that embeds asyncio inside ``tkinter.mainloop()`` using
    :param async_fn: The async function to run as the top-level coroutine.
    :param args: Positional arguments forwarded to *async_fn*.
    :param run_sync_soon_threadsafe: A callable that schedules a zero-argument
-       callable on the host event loop's thread.  It must be thread-safe,
-       must not block, and must not raise; it need not preserve ordering.
-       For Tkinter use a ``root.call('after', 'idle', ...)`` wrapper; for
-       Qt use a ``QMetaObject.invokeMethod`` wrapper; etc.
+       callable on the host event loop's thread.  It must be thread-safe
+       and must not raise.  It must return before the callable runs, even
+       when called on the host thread, and must never wait for the
+       callable to run, which can deadlock.  It is called both on the host
+       thread, where it must not wait for the host loop at all, and from
+       the I/O thread, where it may wait for the host loop to accept the
+       callable, but then the run, and the interpreter's exit, hang if the
+       host loop stops while it waits.  It need not preserve ordering.  If
+       it raises when :func:`start_guest_run` first calls it, without
+       having run the callable, the main task, and any other task
+       *async_fn* created, are cancelled, the loop is closed, and the
+       exception propagates.  For Tkinter, see the example above: every
+       tkinter call made from another thread waits for Tk's main loop to
+       accept it, and its ``TkHost`` class explains what that means.  For
+       Qt, use a queued connection, not a direct, automatic or blocking
+       one; etc.
    :param done_callback: Called on the host thread after the run has fully
        finished and the loop is closed (see :ref:`asyncio-guest-lifecycle`).
        Receives the :class:`Task` as its sole argument.  Inspect the
@@ -142,14 +154,24 @@ In guest mode the *host* owns signal handling:
 Host Requirements
 =================
 
-* *run_sync_soon_threadsafe* must be thread-safe, non-blocking, and must
-  not raise.  It may run callbacks in any order.
+* *run_sync_soon_threadsafe* must be thread-safe, must not raise, must
+  return before the callable runs, and must never wait for the callable
+  to run.  On the host thread it must not wait for the host loop at all.
+  It may run callbacks in any order.
 * Host code running *outside* guest callbacks (for example a GUI button
   handler) must interact with the loop exclusively through
   :meth:`loop.call_soon_threadsafe`, even though it runs on the loop's
   own thread: the I/O thread may be inside the selector, and only
   ``call_soon_threadsafe`` wakes it safely.
 * :meth:`loop.stop` is not supported in guest mode.
+* A modal loop (a modal dialog, or moving or resizing a window on
+  Windows) entered by host code keeps the guest run going, as long as it
+  runs the host's queue.  Guest code must not enter one: the batch that
+  entered it is still running, so the run makes no progress until it
+  returns, and if the modal loop runs the host's queue, it may run
+  callables the run already posted re-entrantly.  To show a modal dialog
+  from guest code, post it to the host with *run_sync_soon_threadsafe*
+  and await its answer.
 
 .. rubric:: Low-level Event Loop Methods
 

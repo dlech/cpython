@@ -20,7 +20,35 @@ import traceback
 # -- Host adapter for Tkinter ------------------------------------------
 
 class TkHost:
-    """Bridge between asyncio guest mode and the Tk event loop."""
+    """Bridge between asyncio guest mode and the Tk event loop.
+
+    Every tkinter call made from another thread waits for Tk's main
+    loop, so this posts with Tk's ``after idle``, through ``root.call()``,
+    which waits too.  That is thread-safe with a threaded Tcl, the
+    default, but called from another thread, it raises RuntimeError if
+    the thread that created the root isn't in ``mainloop()`` within
+    about a second, which abandons the run.  So the host runs
+    ``root.mainloop()``, not ``update()`` in a loop, until done_callback.
+
+    ``after idle``, not ``after 0``: Tk redraws widgets in idle handlers,
+    which run only when no other events are pending, so a busy guest
+    posting its next batch with ``after 0`` would starve them, while
+    ``after idle`` takes turns with them.  Guest code must not call
+    ``update()`` or ``update_idletasks()``: they could run a callable the
+    run has already posted while the batch is still running.
+
+    From another thread, ``root.call()`` does not return until Tk's main
+    loop has run the ``after idle`` command, though not the callable.  So
+    posting from the I/O thread blocks it while the main thread is busy,
+    and if the root were destroyed while such a call is waiting, the I/O
+    thread would wait forever and the interpreter would never exit.
+    Hence the root is destroyed only in done_callback, after the last
+    post.  On Unix, ``root.tk.createfilehandler()`` avoids blocking: post
+    by appending to the queue and sending a byte, without blocking, to
+    one end of a socket.socketpair().  The file handler on the other end
+    reads the bytes and posts the queue's runner with ``after idle``,
+    rather than running it, so that a busy guest doesn't starve redraws.
+    """
 
     def __init__(self, root):
         self.root = root
@@ -31,12 +59,7 @@ class TkHost:
         self._q.popleft()()
 
     def run_sync_soon_threadsafe(self, fn):
-        """Schedule *fn* on the Tk thread.
-
-        ``Tkapp_ThreadSend`` (the C layer behind ``root.call`` from a
-        non-Tcl thread) posts the command to the Tcl event queue, making
-        this safe to call from any thread.
-        """
+        """Schedule *fn* on the Tk thread."""
         self._q.append(fn)
         self.root.call('after', 'idle', self._tk_func_name)
 
@@ -71,9 +94,17 @@ async def count(progress, root):
     def request_cancel():
         loop.call_soon_threadsafe(task.cancel)
 
+    def on_close():
+        # Not root.destroy(): the run needs Tk's main loop until
+        # done_callback.  (If the run is abandoned after a failure,
+        # done_callback never comes, so mainloop() never returns, and
+        # the process keeps running with no window.)
+        root.withdraw()
+        request_cancel()
+
     cancel_btn = root.nametowidget('cancel')
     cancel_btn.configure(command=request_cancel)
-    root.protocol("WM_DELETE_WINDOW", request_cancel)
+    root.protocol("WM_DELETE_WINDOW", on_close)
 
     for i in range(1, MAX_COUNT + 1):
         await asyncio.sleep(PERIOD)
