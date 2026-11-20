@@ -1,6 +1,7 @@
 """Tests for asyncio.start_guest_run()."""
 
 import asyncio
+import gc
 import queue
 import signal
 import socket
@@ -154,6 +155,237 @@ class TestGuestRun(GuestTestCase):
         )
         host.run(timeout=5)
         self.assertTrue(task.cancelled())
+
+    def _check_unstarted_run_unwound(self, run_sync_soon_threadsafe,
+                                     exc_type):
+        # The run fails to start: the exception propagates, and the run
+        # leaves nothing behind.  Neither the main task's coroutine nor
+        # one of a task created with it has run, both are closed, no task
+        # is left pending, and the loop is closed.
+        started = []
+
+        async def side():
+            started.append('side')
+
+        async def main():
+            started.append('main')
+
+        coros = []
+
+        def async_fn():
+            coros.append(side())
+            asyncio.get_running_loop().create_task(coros[-1])
+            coros.append(main())
+            return coros[-1]
+
+        loops = []
+        new_event_loop = asyncio.events.new_event_loop
+
+        def capture_loop():
+            loops.append(new_event_loop())
+            return loops[-1]
+
+        with self.assertNoLogs('asyncio', level='ERROR'):
+            with mock.patch.object(asyncio.events, 'new_event_loop',
+                                   capture_loop):
+                with self.assertRaises(exc_type):
+                    asyncio.start_guest_run(
+                        async_fn,
+                        run_sync_soon_threadsafe=run_sync_soon_threadsafe,
+                        done_callback=lambda task: self.fail('done_callback'),
+                    )
+            gc.collect()
+        self.assertEqual(started, [])
+        for coro in coros:
+            self.assertIsNone(coro.cr_frame)  # closed
+        [loop] = loops
+        self.assertTrue(loop.is_closed())
+
+    def test_host_function_raises_at_start(self):
+        class HostGone(Exception):
+            pass
+
+        def run_sync_soon_threadsafe(fn):
+            raise HostGone
+
+        self._check_unstarted_run_unwound(run_sync_soon_threadsafe, HostGone)
+
+    def test_unwind_under_asyncio_host(self):
+        # The host may be an asyncio loop, with start_guest_run() called
+        # from one of its tasks: the unwind hides the host's loop and its
+        # current task, so the guest's tasks can be cancelled (without
+        # the latter, the unwind waits forever), and the host function's
+        # exception propagates.
+        class HostGone(Exception):
+            pass
+
+        def run_sync_soon_threadsafe(fn):
+            raise HostGone
+
+        async def main():
+            host_loop = asyncio.get_running_loop()
+            self._check_unstarted_run_unwound(
+                run_sync_soon_threadsafe, HostGone)
+            self.assertIs(asyncio.get_running_loop(), host_loop)
+
+        asyncio.run(main())
+
+    def test_batches_in_host_task(self):
+        # An asyncio host may run posted callables from one of its tasks,
+        # so that guest batches run while a host task is current: the
+        # guest's tasks must still step, with themselves as current task.
+        async def guest():
+            await asyncio.sleep(0.01)
+            return asyncio.current_task()
+
+        async def pump(queue):
+            while True:
+                (await queue.get())()
+
+        async def main():
+            nonlocal main_task
+            main_task = asyncio.current_task()
+            host_loop = asyncio.get_running_loop()
+            queue = asyncio.Queue()
+            done = host_loop.create_future()
+            pumping = asyncio.create_task(pump(queue))
+            task = asyncio.start_guest_run(
+                guest,
+                run_sync_soon_threadsafe=lambda fn: (
+                    host_loop.call_soon_threadsafe(queue.put_nowait, fn)),
+                done_callback=done.set_result,
+            )
+            try:
+                await asyncio.wait_for(done, support.SHORT_TIMEOUT)
+            finally:
+                pumping.cancel()
+            self.assertIs(asyncio.current_task(), main_task)
+            return task
+
+        main_task = None
+        task = asyncio.run(main())
+        self.assertIs(task.result(), task)
+
+    def test_pure_python_current_task(self):
+        # With the pure-Python current task functions, which keep the
+        # current task per loop, starting from a host callback, where the
+        # host loop has no current task, must not try to clear one.
+        async def guest():
+            await asyncio.sleep(0)
+            return 'done'
+
+        async def main():
+            host_loop = asyncio.get_running_loop()
+            done = host_loop.create_future()
+
+            def start():
+                with mock.patch.object(asyncio.tasks, 'current_task',
+                                       asyncio.tasks._py_current_task), \
+                     mock.patch.object(asyncio.tasks, '_swap_current_task',
+                                       asyncio.tasks._py_swap_current_task):
+                    try:
+                        asyncio.start_guest_run(
+                            guest,
+                            run_sync_soon_threadsafe=(
+                                host_loop.call_soon_threadsafe),
+                            done_callback=done.set_result,
+                        )
+                    except BaseException as exc:
+                        done.set_exception(exc)
+
+            host_loop.call_soon(start)
+            return await asyncio.wait_for(done, support.SHORT_TIMEOUT)
+
+        task = asyncio.run(main())
+        self.assertEqual(task.result(), 'done')
+
+    def test_host_function_runs_callable_at_start(self):
+        # A host function that breaks its contract by running the first
+        # batch before it returns, and then raises: guest code has run,
+        # and may be stuck halfway, so the unwind only closes the loop,
+        # rather than run guest code again or wait for it.
+        class HostGone(Exception):
+            pass
+
+        steps = []
+
+        def run_sync_soon_threadsafe(fn):
+            if not steps:
+                fn()
+                raise HostGone
+
+        async def main():
+            steps.append('started')
+            try:
+                await asyncio.sleep(0)
+            finally:
+                steps.append('resumed')
+
+        loops = []
+        new_event_loop = asyncio.events.new_event_loop
+
+        def capture_loop():
+            loops.append(new_event_loop())
+            return loops[-1]
+
+        with mock.patch.object(asyncio.events, 'new_event_loop',
+                               capture_loop):
+            with self.assertRaises(HostGone):
+                asyncio.start_guest_run(
+                    main,
+                    run_sync_soon_threadsafe=run_sync_soon_threadsafe,
+                    done_callback=lambda task: self.fail('done_callback'),
+                )
+        self.assertEqual(steps, ['started'])
+        [loop] = loops
+        self.assertTrue(loop.is_closed())
+        self.assertIsNone(asyncio._get_running_loop())
+        with self.assertLogs('asyncio', level='ERROR'):
+            # The abandoned main task.
+            support.gc_collect()
+
+    def test_posted_finish_after_failed_start(self):
+        # A host function that runs the first batch before it returns, in
+        # which the main task finishes, queues the run's _finish() and
+        # then raises: the run has failed to start, so running the queued
+        # callable later does nothing, and done_callback is never called.
+        class HostGone(Exception):
+            pass
+
+        calls = 0
+        posted = []
+
+        def run_sync_soon_threadsafe(fn):
+            # Run the first batch, and the one it posts, in which the
+            # main task's done callback posts _finish(); queue the rest.
+            nonlocal calls
+            calls += 1
+            if calls > 2:
+                posted.append(fn)
+                return
+            first = calls == 1
+            fn()
+            if first:
+                raise HostGone
+
+        async def main():
+            return 'done'
+
+        with self.assertRaises(HostGone):
+            asyncio.start_guest_run(
+                main,
+                run_sync_soon_threadsafe=run_sync_soon_threadsafe,
+                done_callback=lambda task: self.fail('done_callback'),
+            )
+        self.assertTrue(posted)
+        for fn in posted:
+            fn()
+
+    def test_refused_at_interpreter_shutdown(self):
+        with mock.patch.object(asyncio.guest, '_ensure_atexit'), \
+             mock.patch.object(asyncio.guest, '_shutting_down', True):
+            self._check_unstarted_run_unwound(
+                lambda fn: self.fail('posted at shutdown'), RuntimeError)
 
     def test_starts_after_return(self):
         started = False

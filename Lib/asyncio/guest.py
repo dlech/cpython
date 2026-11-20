@@ -108,9 +108,34 @@ def _set_thread_state(state):
     sys.set_coroutine_origin_tracking_depth(origin_tracking_depth)
 
 
+def _hide_host_task(host_state):
+    """Clear the host loop's current task, if any, and return it.
+
+    Must be called while the host loop is the running loop.  With the C
+    Task implementation, which keeps the current task per thread, guest
+    tasks cannot step while another task is current, as one is when
+    guest work runs from a host task, e.g. when start_guest_run() is
+    called from one, or the host runs posted callables from one.
+    """
+    host_loop = host_state[0]
+    if host_loop is None:
+        return None
+    host_task = tasks.current_task(host_loop)
+    if host_task is not None:
+        tasks._swap_current_task(host_loop, None)
+    return host_task
+
+
+def _restore_host(host_state, host_task):
+    """Restore the host's thread state and current task."""
+    _set_thread_state(host_state)
+    if host_task is not None:
+        tasks._swap_current_task(host_state[0], host_task)
+
+
 @contextlib.contextmanager
 def _host_loop_hidden():
-    """Hide the host's running loop, if any, and restore the thread state.
+    """Hide the host's running loop and task, if any, and restore them.
 
     The guest loop must not start, or be driven to completion at
     shutdown, while another loop is the thread's running loop.  An
@@ -118,11 +143,12 @@ def _host_loop_hidden():
     the two loops never actually run nested.
     """
     state = _get_thread_state()
+    host_task = _hide_host_task(state)
     events._set_running_loop(None)
     try:
         yield
     finally:
-        _set_thread_state(state)
+        _restore_host(state, host_task)
 
 
 def start_guest_run(async_fn, *args,
@@ -139,8 +165,17 @@ def start_guest_run(async_fn, *args,
 
     run_sync_soon_threadsafe is a callable that schedules a
     zero-argument callable to run on the host loop's thread.  It must be
-    thread-safe, must not block, and must not raise; it need not
-    preserve ordering.
+    thread-safe and must not raise.  It must return before the callable
+    runs, even when called on the host thread, and must never wait for
+    the callable to run, which can deadlock.  It is called both on the
+    host thread, where it must not wait for the host loop at all, and
+    from the I/O thread, where it may wait for the host loop to accept
+    the callable, but then the run, and the interpreter's exit, hang if
+    the host loop stops while it waits.  It need not preserve ordering.
+    If it raises when start_guest_run() first calls it, without having
+    run the callable, the main task, and any other task async_fn(*args)
+    created, are cancelled, the loop is closed, and the exception
+    propagates.
 
     done_callback is called on the host thread after the run has fully
     finished: remaining tasks cancelled, asynchronous generators and the
@@ -155,6 +190,14 @@ def start_guest_run(async_fn, *args,
     loop.is_running() is true for the whole run.  async_fn starts
     running in the first callback passed to run_sync_soon_threadsafe,
     after start_guest_run() has returned.
+
+    A modal loop entered by host code keeps the run going, as long as it
+    runs the host's queue.  Guest code must not enter one: the batch that
+    entered it is still running, so the run makes no progress until it
+    returns, and if the modal loop runs the host's queue, it may run
+    callables the run already posted re-entrantly.  To show a modal
+    dialog from guest code, post it to the host with
+    run_sync_soon_threadsafe and await its answer.
 
     Signal handling stays with the host: the guest loop never touches
     signal.set_wakeup_fd(), and loop.add_signal_handler() raises
@@ -197,6 +240,9 @@ def start_guest_run(async_fn, *args,
     poll_deadline = None
     finished = False
     cleaned_up = False
+    # Whether a batch has run: start_guest_run() only expects that if
+    # the host function broke its contract by running the callable.
+    batch_ran = False
 
     # Mark the loop as running for the whole guest run.  On Windows this
     # also starts the proactor's self-reading loop, so that
@@ -220,27 +266,29 @@ def start_guest_run(async_fn, *args,
     # -- helpers (host thread unless noted) ----------------------------
 
     def _enter_guest():
-        # Install the guest's per-thread state; return the host's.
+        # Install the guest's per-thread state, with no current task;
+        # return the host's.
         host_state = _get_thread_state()
+        host_task = _hide_host_task(host_state)
         _set_thread_state(guest_state)
-        return host_state
+        return host_state, host_task
 
-    def _leave_guest(host_state):
+    def _leave_guest(host):
         # Keep changes made by guest callbacks, e.g. by loop.set_debug().
         nonlocal guest_state
         guest_state = _get_thread_state()
-        _set_thread_state(host_state)
+        _restore_host(*host)
 
     def _cleanup_running_state():
         nonlocal cleaned_up
         if cleaned_up:
             return
         cleaned_up = True
-        host_state = _enter_guest()
+        host = _enter_guest()
         try:
             loop._run_forever_cleanup()
         finally:
-            _set_thread_state(host_state)
+            _restore_host(*host)
 
     def _join_backend():
         # By the token invariant the I/O thread is parked in
@@ -297,7 +345,7 @@ def start_guest_run(async_fn, *args,
             # The failed poll took these events before failing: process
             # them, or their futures would never complete, and closing the
             # loop would wait for them.
-            host_state = _enter_guest()
+            host = _enter_guest()
             try:
                 loop.process_events(event_list)
             except Exception as e:
@@ -307,7 +355,7 @@ def start_guest_run(async_fn, *args,
                     'exception': e,
                 })
             finally:
-                _leave_guest(host_state)
+                _leave_guest(host)
         _cleanup_running_state()
         if not main_task.done():
             main_task.cancel(
@@ -329,10 +377,11 @@ def start_guest_run(async_fn, *args,
 
     def _process_on_host(event_list):
         """Process one batch of asyncio work on the host thread."""
-        nonlocal poll_deadline
+        nonlocal poll_deadline, batch_ran
         if shutdown.is_set() or loop.is_closed():
             return
-        host_state = _enter_guest()
+        batch_ran = True
+        host = _enter_guest()
         try:
             loop.process_events(event_list)
             event_list = None
@@ -347,7 +396,7 @@ def start_guest_run(async_fn, *args,
             wakeup.release()
             raise
         finally:
-            _leave_guest(host_state)
+            _leave_guest(host)
         if shutdown.is_set():
             return
         # Fast path: poll without blocking on the host thread.  If there
@@ -433,6 +482,25 @@ def start_guest_run(async_fn, *args,
         if backend_thread.ident is not None:
             backend_thread.join()
 
+    def _unwind_unstarted():
+        # The run failed to start: cancel the main task, and any task
+        # async_fn(*args) created, before their coroutines ever run, and
+        # run the loop until the cancellations have closed them, so
+        # nothing is left pending.  If the host function ran a batch
+        # anyway, guest code may be stuck halfway, and waiting for it
+        # could hang, so just close the loop.  Mark the run finished, so
+        # that a _finish() or _abort() it posted does nothing.
+        nonlocal finished
+        finished = True
+        _cleanup_running_state()
+        main_task.remove_done_callback(_on_task_done)
+        try:
+            if not batch_ran:
+                with _host_loop_hidden():
+                    runners._cancel_all_tasks(loop)
+        finally:
+            _close_loop()
+
     # -- start ---------------------------------------------------------
 
     main_task.add_done_callback(_on_task_done)
@@ -445,8 +513,7 @@ def start_guest_run(async_fn, *args,
         if not shutting_down:
             _stoppers.add(_stop_at_exit)
     if shutting_down:
-        _cleanup_running_state()
-        _close_loop()
+        _unwind_unstarted()
         raise RuntimeError(
             'cannot start an asyncio guest run at interpreter shutdown')
 
@@ -461,8 +528,7 @@ def start_guest_run(async_fn, *args,
         with _lock:
             _stoppers.discard(_stop_at_exit)
         _join_backend()
-        _cleanup_running_state()
-        _close_loop()
+        _unwind_unstarted()
         raise
 
     return main_task
