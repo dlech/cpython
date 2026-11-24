@@ -82,13 +82,12 @@ example that embeds asyncio inside ``tkinter.mainloop()`` using
        callable, but then the run, and the interpreter's exit, hang if the
        host loop stops while it waits.  It need not preserve ordering.  If
        it raises when :func:`start_guest_run` first calls it, without
-       having run the callable, the main task, and any other task
-       *async_fn* created, are cancelled, the loop is closed, and the
-       exception propagates.  For Tkinter, see the example above: every
-       tkinter call made from another thread waits for Tk's main loop to
-       accept it, and its ``TkHost`` class explains what that means.  For
-       Qt, use a queued connection, not a direct, automatic or blocking
-       one; etc.
+       having run the callable, the run's tasks are cancelled and
+       awaited, the loop is closed, and the exception propagates.  For
+       Tkinter, see the example above: every tkinter call made from
+       another thread waits for Tk's main loop to accept it, and its
+       ``TkHost`` class explains what that means.  For Qt, use a queued
+       connection, not a direct, automatic or blocking one; etc.
    :param done_callback: Called on the host thread after the run has fully
        finished and the loop is closed (see :ref:`asyncio-guest-lifecycle`).
        Receives the :class:`Task` as its sole argument.  Inspect the
@@ -110,21 +109,25 @@ example that embeds asyncio inside ``tkinter.mainloop()`` using
 Lifecycle and Cleanup
 =====================
 
-*async_fn* starts running in the first callback passed to
-*run_sync_soon_threadsafe*, after :func:`start_guest_run` has returned.
+The main task starts running in the first callback passed to
+*run_sync_soon_threadsafe*, after :func:`start_guest_run` has returned,
+unless the loop has an eager task factory (see :func:`eager_task_factory`),
+for example set by *async_fn*, which runs the main task's first step at
+once.  If the start then fails, the cancelled tasks' cleanup runs inside
+:func:`start_guest_run`, where it must not wait for the host.
 
-The guest loop is the host thread's running loop only while guest
-callbacks run.  Around each batch of callbacks, the thread's running
-loop, asynchronous generator hooks (see :func:`sys.set_asyncgen_hooks`)
-and coroutine origin tracking depth are switched to the guest's, and
-the host's are restored afterwards.  So inside guest tasks
-:func:`get_running_loop` returns the guest loop and starting another
-event loop — including a nested :func:`asyncio.run` or
-:meth:`loop.run_until_complete` — raises :exc:`RuntimeError`, while host
-code keeps its own state: asynchronous generators it iterates are not
-finalized by the guest loop, and the host may itself be an asyncio event
-loop.  :meth:`loop.is_running() <asyncio.loop.is_running>` returns
-``True`` for the whole guest run.
+The guest loop is the host thread's running loop only while guest code
+runs, such as in batches of callbacks, at start, and in the final cleanup.
+Around each batch of callbacks, the thread's running loop, asynchronous
+generator hooks (see :func:`sys.set_asyncgen_hooks`) and coroutine
+origin tracking depth are switched to the guest's, and the host's are
+restored afterwards.  So inside guest tasks :func:`get_running_loop`
+returns the guest loop and starting another event loop — including a
+nested :func:`asyncio.run` or :meth:`loop.run_until_complete` — raises
+:exc:`RuntimeError`, while host code keeps its own state: asynchronous
+generators it iterates are not finalized by the guest loop, and the host
+may itself be an asyncio event loop.  :meth:`loop.is_running()
+<asyncio.loop.is_running>` returns ``True`` for the whole guest run.
 
 When the main task finishes, cleanup equivalent to :func:`asyncio.run`
 takes place on the host thread: remaining tasks are cancelled,
@@ -162,7 +165,30 @@ Host Requirements
   handler) must interact with the loop exclusively through
   :meth:`loop.call_soon_threadsafe`, even though it runs on the loop's
   own thread: the I/O thread may be inside the selector, and only
-  ``call_soon_threadsafe`` wakes it safely.
+  ``call_soon_threadsafe`` wakes it safely.  Complete a future with
+  ``loop.call_soon_threadsafe(fut.set_result, value)``, and create a task
+  with ``loop.call_soon_threadsafe(loop.create_task, coro)``.
+  :func:`asyncio.create_task` from host code raises :exc:`RuntimeError`,
+  as no loop is running, or with an asyncio host, creates the task on the
+  host's loop.
+* In :ref:`debug mode <asyncio-debug-mode>`, :meth:`loop.call_soon`,
+  :meth:`loop.call_later`, :meth:`loop.call_at` and
+  :meth:`loop.create_task` raise :exc:`RuntimeError` when host code calls
+  them between batches, as they do when called from another thread.  The
+  check reports the mistake rather than repairing it, so the operation may
+  be left half done: for example, :meth:`loop.create_task` raises once the
+  task is made, leaving it pending, and an unclosed :class:`StreamWriter`
+  that the garbage collector finalizes during host code reports "Exception
+  ignored" and leaves its connection half closed.  It can't see calls that
+  don't schedule through those methods, such as :meth:`loop.stop`,
+  :meth:`Handle.cancel`, :meth:`Future.add_done_callback` on a pending
+  future, and with a selector event loop :meth:`loop.add_reader` and
+  :meth:`loop.remove_reader`.  With an eager task factory,
+  :meth:`loop.create_task` runs the task's first step at once instead: with
+  the C :class:`Task` implementation (the default), that raises
+  :exc:`RuntimeError` in any mode, because the loop isn't the running loop,
+  while with the pure-Python :class:`Task`, the step runs as host code,
+  which the check may not catch.
 * :meth:`loop.stop` is not supported in guest mode.
 * A modal loop (a modal dialog, or moving or resizing a window on
   Windows) entered by host code keeps the guest run going, as long as it

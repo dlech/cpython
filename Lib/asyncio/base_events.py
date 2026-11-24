@@ -454,6 +454,11 @@ class BaseEventLoop(events.AbstractEventLoop):
         # loop (see asyncio.start_guest_run); signal handling is then
         # delegated to the host.
         self._guest_mode = False
+        # True while a guest run's own code runs on the loop's thread: set
+        # by start_guest_run() around each batch, the start's guest code, the
+        # processing of a failed poll's events and the unwind of a failed
+        # start, and from the final cleanup on.
+        self._guest_code_running = False
         self._exception_handler = None
         self.set_debug(coroutines._is_debug_mode())
         # The preserved state of async generator hooks.
@@ -893,6 +898,18 @@ class BaseEventLoop(events.AbstractEventLoop):
             raise RuntimeError(
                 "Non-thread-safe operation invoked on an event loop other "
                 "than the current one")
+        # A guest loop (see asyncio.start_guest_run) runs for the whole
+        # guest run, but its own code runs only while _guest_code_running
+        # is set.  At other times, on the loop's own thread, the caller
+        # is host code, between batches: nothing would wake the I/O
+        # thread's wait for the work it schedules.  (Guest code of
+        # another guest run that this loop hosts runs while this loop's
+        # own code runs.)
+        if self._guest_mode and not self._guest_code_running:
+            raise RuntimeError(
+                "Non-thread-safe operation invoked on an asyncio guest loop "
+                "from host code, between its batches: use "
+                "loop.call_soon_threadsafe()")
 
     def call_soon_threadsafe(self, callback, *args, context=None):
         """Like call_soon(), but thread-safe."""
